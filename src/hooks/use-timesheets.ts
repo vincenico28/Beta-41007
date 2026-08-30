@@ -1,0 +1,193 @@
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { supabase } from '@/lib/supabase'
+import { format, startOfWeek, endOfWeek } from 'date-fns'
+import type { TimesheetEntry, TimesheetPeriod } from '@/types'
+
+import { useAuthStore } from '@/stores/auth.store'
+
+export function useTimesheetEntries(employeeId: string | undefined, startDate: string, endDate: string) {
+  const { employee } = useAuthStore()
+  return useQuery({
+    queryKey: ['timesheet-entries', employeeId, employee?.id, startDate, endDate],
+    queryFn: async () => {
+      let q = supabase
+        .from('timesheet_entries')
+        .select('*, employees!employee_id(id, first_name, last_name, avatar_url, position, departments(name))')
+        .gte('date', startDate)
+        .lte('date', endDate)
+        .order('date', { ascending: true })
+
+      if (employeeId) {
+        q = q.eq('employee_id', employeeId)
+      } else if (employee && !['super_admin', 'admin', 'hr_manager', 'team_supervisor'].includes(employee.role || '')) {
+        q = q.eq('employee_id', employee.id)
+      }
+
+      const { data, error } = await q
+      if (error) throw error
+      return data as TimesheetEntry[]
+    },
+    enabled: !!startDate && !!endDate,
+  })
+}
+
+export function useTimesheetPeriods(orgId: string) {
+  return useQuery({
+    queryKey: ['timesheet-periods', orgId],
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from('timesheet_periods')
+        .select('*')
+        .eq('org_id', orgId)
+        .order('start_date', { ascending: false })
+        .limit(12)
+      if (error) throw error
+      return data as TimesheetPeriod[]
+    },
+    enabled: !!orgId,
+  })
+}
+
+export function useCreateTimesheetEntry() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (entry: Partial<TimesheetEntry>) => {
+      // Omit generated column total_hours so PostgreSQL can calculate it automatically
+      const { total_hours, ...payload } = entry as any
+      const { data, error } = await supabase
+        .from('timesheet_entries')
+        .insert(payload)
+        .select()
+        .single()
+      if (error) throw error
+      return data
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['timesheet-entries'] }),
+  })
+}
+
+export function useUpdateTimesheetEntry() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ id, ...updates }: Partial<TimesheetEntry> & { id: string }) => {
+      // Omit generated column total_hours so PostgreSQL can calculate it automatically
+      const { total_hours, ...payload } = updates as any
+      const { data, error } = await supabase
+        .from('timesheet_entries')
+        .update({ ...payload, updated_at: new Date().toISOString() })
+        .eq('id', id)
+        .select()
+        .single()
+      if (error) throw error
+      return data
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['timesheet-entries'] }),
+  })
+}
+
+export function useDeleteTimesheetEntry() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const { error } = await supabase
+        .from('timesheet_entries')
+        .delete()
+        .eq('id', id)
+      if (error) throw error
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['timesheet-entries'] }),
+  })
+}
+
+export function useApproveTimesheetEntry() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ id, approvedBy }: { id: string; approvedBy: string }) => {
+      const { data, error } = await supabase
+        .from('timesheet_entries')
+        .update({
+          is_approved: true,
+          approved_by: approvedBy,
+          approved_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', id)
+        .select()
+        .single()
+      if (error) throw error
+      return data
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['timesheet-entries'] }),
+  })
+}
+
+export function useBulkApproveTimesheetEntries() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ ids, approvedBy }: { ids: string[]; approvedBy: string }) => {
+      const { error } = await supabase
+        .from('timesheet_entries')
+        .update({
+          is_approved: true,
+          approved_by: approvedBy,
+          approved_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .in('id', ids)
+      if (error) throw error
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['timesheet-entries'] }),
+  })
+}
+
+export function useRejectTimesheetEntry() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ id, notes }: { id: string; notes?: string }) => {
+      const { data, error } = await supabase
+        .from('timesheet_entries')
+        .update({
+          is_approved: false,
+          approved_by: null,
+          approved_at: null,
+          notes: notes || 'Rejected by supervisor',
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', id)
+        .select()
+        .single()
+      if (error) throw error
+      return data
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['timesheet-entries'] }),
+  })
+}
+
+export function useBulkCreateTimesheetEntries() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (entries: Partial<TimesheetEntry>[]) => {
+      const sanitizedEntries = entries.map(entry => {
+        const { total_hours, ...payload } = entry as any
+        return payload
+      })
+      const { data, error } = await supabase
+        .from('timesheet_entries')
+        .insert(sanitizedEntries)
+        .select()
+      if (error) throw error
+      return data
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['timesheet-entries'] }),
+  })
+}
+
+// Utility function to get the current week's date range
+export function getWeekRange(date: Date = new Date()) {
+  const start = startOfWeek(date, { weekStartsOn: 1 })
+  const end = endOfWeek(date, { weekStartsOn: 1 })
+  return {
+    startDate: format(start, 'yyyy-MM-dd'),
+    endDate: format(end, 'yyyy-MM-dd'),
+  }
+}

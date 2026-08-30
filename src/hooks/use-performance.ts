@@ -1,0 +1,140 @@
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { supabase } from '@/lib/supabase'
+import type { PerformanceReview } from '@/types'
+
+import { useAuthStore } from '@/stores/auth.store'
+
+export function usePerformanceReviews(employeeId?: string) {
+  const { employee } = useAuthStore()
+  return useQuery({
+    queryKey: ['performance-reviews', employeeId, employee?.id],
+    queryFn: async () => {
+      let q = supabase
+        .from('performance_reviews')
+        .select('*, employees!performance_reviews_employee_id_fkey(id, first_name, last_name, avatar_url, position, departments(name)), reviewer:employees!performance_reviews_reviewer_id_fkey(id, first_name, last_name)')
+        .order('created_at', { ascending: false })
+      if (employeeId) q = q.eq('employee_id', employeeId)
+      else if (employee?.role === 'employee') {
+        q = q.eq('employee_id', employee.id)
+      }
+      const { data, error } = await q
+      if (error) throw error
+      return data as PerformanceReview[]
+    },
+  })
+}
+
+export function useCreatePerformanceReview() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (review: Partial<PerformanceReview>) => {
+      const { data, error } = await supabase
+        .from('performance_reviews')
+        .insert(review)
+        .select()
+        .single()
+      if (error) {
+        // If the Supabase schema cache hasn't loaded review_type or goals_data yet
+        if (
+          error.message?.includes('review_type') || 
+          error.details?.includes('review_type') || 
+          error.message?.includes('goals_data') ||
+          error.details?.includes('goals_data') ||
+          (error as any).code === 'PGRST204'
+        ) {
+          const { review_type, goals_data, employees, reviewer, ...cleanReview } = review as any
+          const { data: retryData, error: retryError } = await supabase
+            .from('performance_reviews')
+            .insert(cleanReview)
+            .select()
+            .single()
+          if (retryError) throw retryError
+          return retryData
+        }
+        throw error
+      }
+      return data
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['performance-reviews'] }),
+  })
+}
+
+export function useUpdatePerformanceReview() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ id, ...updates }: Partial<PerformanceReview> & { id: string }) => {
+      const { data, error } = await supabase
+        .from('performance_reviews')
+        .update({ ...updates, updated_at: new Date().toISOString() })
+        .eq('id', id)
+        .select()
+        .single()
+      if (error) {
+        if (
+          error.message?.includes('review_type') || 
+          error.details?.includes('review_type') || 
+          error.message?.includes('goals_data') ||
+          error.details?.includes('goals_data') ||
+          (error as any).code === 'PGRST204'
+        ) {
+          const { review_type, goals_data, employees, reviewer, ...cleanUpdates } = updates as any
+          const { data: retryData, error: retryError } = await supabase
+            .from('performance_reviews')
+            .update({ ...cleanUpdates, updated_at: new Date().toISOString() })
+            .eq('id', id)
+            .select()
+            .single()
+          if (retryError) throw retryError
+          return retryData
+        }
+        throw error
+      }
+      return data
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['performance-reviews'] }),
+  })
+}
+
+export function useAcknowledgePerformanceReview() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ id, employeeComments }: { id: string; employeeComments?: string }) => {
+      const { data, error } = await supabase
+        .from('performance_reviews')
+        .update({
+          status: 'acknowledged',
+          acknowledged_at: new Date().toISOString(),
+          employee_comments: employeeComments || null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', id)
+        .select()
+        .single()
+      if (error) {
+        if (
+          error.message?.includes('acknowledged_at') || 
+          error.details?.includes('acknowledged_at') ||
+          error.message?.includes('employee_comments') || 
+          error.details?.includes('employee_comments') ||
+          (error as any).code === 'PGRST204'
+        ) {
+          const { data: retryData, error: retryError } = await supabase
+            .from('performance_reviews')
+            .update({
+              status: 'acknowledged',
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', id)
+            .select()
+            .single()
+          if (retryError) throw retryError
+          return retryData
+        }
+        throw error
+      }
+      return data
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['performance-reviews'] }),
+  })
+}
+

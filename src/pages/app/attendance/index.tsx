@@ -1,0 +1,1772 @@
+import { useState, useEffect, useMemo, useRef } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
+import { format, subDays, startOfMonth, endOfMonth, isSameDay, parseISO } from 'date-fns'
+import {
+  Clock, CheckCircle, XCircle, AlertCircle, TimerReset, MapPin, Download,
+  Loader2, Camera, ShieldCheck, ShieldAlert, Globe, SwitchCamera, Sliders,
+  PlusCircle, Edit2, Trash2, Printer, Search, Building2, Filter, AlertTriangle,
+  FileSpreadsheet, UserCheck, Users, Eye, CheckSquare, Sparkles, Check, MoreHorizontal,
+  Flag, Info
+} from 'lucide-react'
+import {
+  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger
+} from '@/components/ui/dropdown-menu'
+import {
+  useAttendance, useAttendanceRange, useClockIn, useClockOut,
+  useTodayAttendance, useManualAttendanceRecord, useDeleteAttendanceRecord
+} from '@/hooks/use-attendance'
+import { useSchedules } from '@/hooks/use-schedules'
+import { calculateScheduleCompliance } from '@/utils/schedule-compliance'
+import { formatPHP } from '@/utils/philippine-payroll'
+import { printHtmlElement } from '@/utils/print'
+import { useEmployees } from '@/hooks/use-employees'
+import { useDepartments } from '@/hooks/use-misc'
+import { useAuthStore } from '@/stores/auth.store'
+import { usePermissions } from '@/hooks/use-permissions'
+import { 
+  getHolidayForDate, 
+  getHolidaysForMonth, 
+  getPhilippineHolidays, 
+  DOLE_HOLIDAY_PAY_RULES, 
+  type PhilippineHoliday 
+} from '@/utils/philippine-holidays'
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import { Switch } from '@/components/ui/switch'
+import { Label } from '@/components/ui/label'
+import { Input } from '@/components/ui/input'
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
+import { Skeleton } from '@/components/ui/skeleton'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Calendar } from '@/components/ui/calendar'
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from '@/components/ui/select'
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
+} from '@/components/ui/dialog'
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
+  AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { WebcamCapture } from '@/components/face-recognition/WebcamCapture'
+import { LocationMapDialog } from '@/components/attendance/LocationMapDialog'
+import { DailyAttendanceMap } from '@/components/attendance/DailyAttendanceMap'
+import { LiveGeofenceMap } from '@/components/attendance/LiveGeofenceMap'
+import { playSuccessSound, playErrorSound } from '@/utils/audio'
+import { toast } from 'sonner'
+import { downloadCSV } from '@/utils/export'
+import { calculateDistance } from '@/utils/geo'
+import { supabase, ORG_ID } from '@/lib/supabase'
+import type { AttendanceRecord, Employee } from '@/types'
+
+const ATT_STATUS_CONFIG: Record<string, { label: string; className: string; icon: React.ElementType }> = {
+  present: { label: 'Present', className: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400', icon: CheckCircle },
+  late: { label: 'Late', className: 'bg-amber-100 text-amber-700 dark:bg-amber-950/50 dark:text-amber-400', icon: AlertCircle },
+  absent: { label: 'Absent', className: 'bg-red-100 text-red-700 dark:bg-red-950/50 dark:text-red-400', icon: XCircle },
+  holiday: { label: 'Holiday (DOLE)', className: 'bg-blue-100 text-blue-700 dark:bg-blue-950/50 dark:text-blue-400', icon: Flag },
+  half_day: { label: 'Half Day', className: 'bg-purple-100 text-purple-700 dark:bg-purple-950/50 dark:text-purple-400', icon: AlertCircle },
+  ob: { label: 'Official Business (OB)', className: 'bg-sky-100 text-sky-700 dark:bg-sky-950/50 dark:text-sky-400', icon: Globe },
+}
+
+interface GeofenceState {
+  lat: number
+  lng: number
+  radius: number
+  enabled: boolean
+}
+
+// ================= CLOCK WIDGET COMPONENT =================
+function ClockWidget({ geofenceSettings }: { geofenceSettings: GeofenceState | null }) {
+  const { employee } = useAuthStore()
+  const { data: todayAtt, refetch } = useTodayAttendance(employee?.id ?? '')
+  const clockIn = useClockIn()
+  const clockOut = useClockOut()
+  const [time, setTime] = useState(new Date())
+
+  useEffect(() => {
+    const t = setInterval(() => setTime(new Date()), 1000)
+    return () => clearInterval(t)
+  }, [])
+
+  const isIn = !!todayAtt?.clock_in && !todayAtt?.clock_out
+  const isDone = !!todayAtt?.clock_in && !!todayAtt?.clock_out
+
+  const [showFaceVerification, setShowFaceVerification] = useState(false)
+  const [isVerifying, setIsVerifying] = useState(false)
+  const [isAcquiringGps, setIsAcquiringGps] = useState(false)
+  
+  const [permissionsGranted, setPermissionsGranted] = useState<boolean | null>(null)
+  const [checkingPermissions, setCheckingPermissions] = useState(false)
+  const [userLocation, setUserLocation] = useState<{lat: number, lng: number} | null>(null)
+  const [liveGpsAccuracy, setLiveGpsAccuracy] = useState<number | null>(null)
+  const [gpsFailureDetails, setGpsFailureDetails] = useState<{ title: string; message: string; accuracy?: number } | null>(null)
+
+  const isGeofenceActive = geofenceSettings?.enabled !== false
+
+  useEffect(() => {
+    let watcher: number
+    if (permissionsGranted) {
+      watcher = navigator.geolocation.watchPosition(
+        (pos) => {
+          setUserLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude })
+          setLiveGpsAccuracy(Math.round(pos.coords.accuracy))
+        },
+        (err) => console.warn("Watch position error:", err),
+        { enableHighAccuracy: true, maximumAge: 0 }
+      )
+    }
+    return () => {
+      if (watcher) navigator.geolocation.clearWatch(watcher)
+    }
+  }, [permissionsGranted])
+
+  useEffect(() => {
+    const checkSilent = async () => {
+      try {
+        const geoStatus = await navigator.permissions.query({ name: 'geolocation' })
+        // @ts-ignore
+        const camStatus = await navigator.permissions.query({ name: 'camera' })
+        if (geoStatus.state === 'granted' && camStatus.state === 'granted') {
+          setPermissionsGranted(true)
+        }
+      } catch (e) {}
+    }
+    checkSilent()
+  }, [])
+
+  const requestPermissions = async () => {
+    setCheckingPermissions(true)
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('Camera API not supported in this browser')
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true })
+      stream.getTracks().forEach(track => track.stop())
+
+      if (!navigator.geolocation) {
+        throw new Error('Geolocation API not supported in this browser')
+      }
+      await new Promise<GeolocationPosition>((resolve, reject) => {
+        navigator.geolocation.getCurrentPosition(resolve, reject, {
+          enableHighAccuracy: true,
+          timeout: 12000,
+          maximumAge: 0
+        })
+      })
+
+      setPermissionsGranted(true)
+      toast.success('Permissions granted successfully!')
+    } catch (err: any) {
+      toast.error('Permissions required', { description: 'Camera and exact GPS access required for verified biometric clock-in.' })
+      setPermissionsGranted(false)
+    } finally {
+      setCheckingPermissions(false)
+    }
+  }
+
+  // ================= STRICT GPS POSITION VERIFICATION ENGINE =================
+  const getStrictGpsLocation = async (): Promise<{ lat: number; lng: number; accuracy: number; timestamp: string; isVerified: boolean }> => {
+    if (!('geolocation' in navigator)) {
+      throw new Error('Geolocation API is not supported on this device or browser.')
+    }
+
+    const position = await new Promise<GeolocationPosition>((resolve, reject) => {
+      navigator.geolocation.getCurrentPosition(resolve, reject, {
+        enableHighAccuracy: true,
+        timeout: 12000,
+        maximumAge: 0,
+      })
+    }).catch((err: GeolocationPositionError) => {
+      if (err.code === 1) throw new Error('Location permission denied. Please allow GPS location access to clock in/out.')
+      if (err.code === 2) throw new Error('GPS position unavailable. Please ensure hardware location / GPS is turned ON.')
+      if (err.code === 3) throw new Error('GPS satellite lock timed out. Please step near a window or outdoors to get a strong GPS signal.')
+      throw new Error(err.message || 'Failed to acquire device GPS position.')
+    })
+
+    const { latitude, longitude, accuracy } = position.coords
+    if (isNaN(latitude) || isNaN(longitude) || (latitude === 0 && longitude === 0)) {
+      throw new Error('Invalid GPS coordinates received from device hardware.')
+    }
+
+    const roundedAccuracy = Math.round(accuracy)
+
+    // STRICT GPS ACCURACY THRESHOLD: Maximum 35 meters uncertainty
+    if (accuracy > 35) {
+      throw new Error(
+        `GPS signal is inaccurate or unreliable (error margin ±${roundedAccuracy}m). The system requires an accuracy within 35 meters. Please ensure High Accuracy Location / GPS is enabled on your device, step into an open area, and retry.`
+      )
+    }
+
+    // GEOFENCE VERIFICATION
+    const { data: org } = await supabase
+      .from('organizations')
+      .select('geofence_settings')
+      .eq('id', ORG_ID)
+      .single()
+      
+    let officeLat = import.meta.env.VITE_OFFICE_LAT ? parseFloat(import.meta.env.VITE_OFFICE_LAT) : 14.5995
+    let officeLng = import.meta.env.VITE_OFFICE_LNG ? parseFloat(import.meta.env.VITE_OFFICE_LNG) : 120.9842
+    let allowedRadius = import.meta.env.VITE_ALLOWED_RADIUS_METERS ? parseInt(import.meta.env.VITE_ALLOWED_RADIUS_METERS) : 100
+    let isEnabled = true
+
+    if (org?.geofence_settings) {
+      const settings = org.geofence_settings as { lat: number; lng: number; radius: number; enabled?: boolean }
+      officeLat = settings.lat ?? officeLat
+      officeLng = settings.lng ?? officeLng
+      allowedRadius = settings.radius ?? allowedRadius
+      if (settings.enabled !== undefined) {
+        isEnabled = settings.enabled
+      }
+    }
+
+    if (isEnabled && officeLat !== null && officeLng !== null && !isNaN(officeLat) && !isNaN(officeLng)) {
+      const distance = calculateDistance(latitude, longitude, officeLat, officeLng)
+      if (distance > allowedRadius) {
+        throw new Error(
+          `Geofence Violation: You are located ${Math.round(distance)}m away from the authorized office hub (${allowedRadius}m allowed). You must be on-site to record attendance.`
+        )
+      }
+    }
+
+    return {
+      lat: latitude,
+      lng: longitude,
+      accuracy: roundedAccuracy,
+      timestamp: new Date().toISOString(),
+      isVerified: true,
+    }
+  }
+
+  // ================= COMMIT ATTENDANCE MUTATION =================
+  const commitAttendance = async (location: { lat: number; lng: number; accuracy: number; timestamp: string; isVerified: boolean }) => {
+    if (!isIn) {
+      const t = toast.loading('Recording verified biometric clock in...')
+      await clockIn.mutateAsync({ employeeId: employee!.id, location })
+      toast.dismiss(t)
+      toast.success('Clocked in successfully!', { 
+        description: `Verified at ${format(new Date(), 'h:mm a')} • GPS Accuracy ±${location.accuracy}m` 
+      })
+    } else {
+      const t = toast.loading('Recording verified biometric clock out...')
+      
+      let anomalyNote = ''
+      if (isGeofenceActive && location && todayAtt?.location?.clockIn && todayAtt.clock_in) {
+        const clockInLoc = todayAtt.location.clockIn as { lat: number; lng: number }
+        const distKm = calculateDistance(clockInLoc.lat, clockInLoc.lng, location.lat, location.lng) / 1000
+        const hoursDiff = (new Date().getTime() - new Date(todayAtt.clock_in).getTime()) / 3600000
+        
+        if (hoursDiff > 0) {
+          const speedKmh = distKm / hoursDiff
+          if (speedKmh > 800) {
+            anomalyNote = `⚠️ SUSPICIOUS LOCATION: Impossible travel detected (${Math.round(speedKmh)} km/h)`
+          }
+        }
+      }
+
+      await clockOut.mutateAsync({ 
+        employeeId: employee!.id, 
+        attendanceId: todayAtt!.id, 
+        location, 
+        notes: anomalyNote || undefined 
+      })
+      toast.dismiss(t)
+      toast.success('Clocked out successfully!', { 
+        description: `Verified at ${format(new Date(), 'h:mm a')} • GPS Accuracy ±${location.accuracy}m` 
+      })
+    }
+    refetch()
+    setShowFaceVerification(false)
+  }
+
+  // ================= INITIATE CLOCK IN / OUT FLOW =================
+  const handleClockClick = async () => {
+    if (!employee?.id) { 
+      toast.error('No employee profile linked')
+      return 
+    }
+
+    setIsAcquiringGps(true)
+    try {
+      // Pre-flight test GPS accuracy & lock
+      const liveLoc = await getStrictGpsLocation()
+      setUserLocation({ lat: liveLoc.lat, lng: liveLoc.lng })
+      setLiveGpsAccuracy(liveLoc.accuracy)
+    } catch (gpsPreErr: any) {
+      setIsAcquiringGps(false)
+      playErrorSound()
+      setGpsFailureDetails({
+        title: 'GPS Verification Failed: Inaccurate Location',
+        message: gpsPreErr.message || 'Unable to establish an accurate GPS lock.',
+      })
+      return
+    } finally {
+      setIsAcquiringGps(false)
+    }
+
+    if ((employee as any).face_encoding) {
+      setShowFaceVerification(true)
+    } else {
+      // Direct commit for staff without face encoding, with strict GPS validation
+      try {
+        const verifiedLoc = await getStrictGpsLocation()
+        await commitAttendance(verifiedLoc)
+      } catch (gpsErr: any) {
+        playErrorSound()
+        setGpsFailureDetails({
+          title: 'GPS Verification Failed: Inaccurate Location',
+          message: gpsErr.message || 'Inaccurate GPS location detected.',
+        })
+      }
+    }
+  }
+
+  // ================= 2-FACTOR FACE & GPS VALIDATION =================
+  const handleFaceVerify = async (imageSrc: string) => {
+    const faceEncoding = (employee as any).face_encoding
+    if (!faceEncoding) {
+      toast.error('No facial profile registered for your account.')
+      return
+    }
+
+    setIsVerifying(true)
+    try {
+      // Step 1: Deep-learning facial recognition validation
+      const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+      const blob = dataURItoBlob(imageSrc)
+      const formData = new FormData()
+      formData.append('file', blob, 'face.jpg')
+      formData.append(
+        'known_encoding',
+        typeof faceEncoding === 'string' ? faceEncoding : JSON.stringify(faceEncoding)
+      )
+
+      const response = await fetch(`${apiBase}/api/verify_face`, {
+        method: 'POST',
+        body: formData,
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}))
+        const errorMsg =
+          typeof errorData.detail === 'string'
+            ? errorData.detail
+            : Array.isArray(errorData.detail)
+              ? errorData.detail.map((d: any) => d.msg || JSON.stringify(d)).join(', ')
+              : 'Face verification failed'
+        throw new Error(errorMsg)
+      }
+
+      const data = await response.json()
+      if (!data.match) {
+        playErrorSound()
+        toast.error('Face verification failed', { description: 'Face does not match registered profile' })
+        return
+      }
+
+      // Step 2: STRICT GPS ACQUISITION AT EXACT INSTANT OF FACE VERIFICATION
+      let verifiedLocation: { lat: number; lng: number; accuracy: number; timestamp: string; isVerified: boolean }
+      try {
+        verifiedLocation = await getStrictGpsLocation()
+      } catch (gpsError: any) {
+        // STRICT POLICY ENFORCEMENT:
+        // Invalidate face verification attempt completely and force repeating the entire process!
+        playErrorSound()
+        setShowFaceVerification(false)
+        setGpsFailureDetails({
+          title: 'GPS Verification Failed: Inaccurate Location',
+          message: gpsError.message || 'The system detected an inaccurate or unreliable GPS position.',
+        })
+        return
+      }
+
+      // Step 3: Atomic Commitment - Both Identity & Location are 100% verified
+      playSuccessSound()
+      await commitAttendance(verifiedLocation)
+    } catch (error: any) {
+      playErrorSound()
+      setShowFaceVerification(false)
+      toast.error('Verification error', { description: error.message || 'Error processing facial recognition' })
+    } finally {
+      setIsVerifying(false)
+    }
+  }
+
+  const dataURItoBlob = (dataURI: string) => {
+    const byteString = atob(dataURI.split(',')[1])
+    const mimeString = dataURI.split(',')[0].split(':')[1].split(';')[0]
+    const ab = new ArrayBuffer(byteString.length)
+    const ia = new Uint8Array(ab)
+    for (let i = 0; i < byteString.length; i++) {
+      ia[i] = byteString.charCodeAt(i)
+    }
+    return new Blob([ab], { type: mimeString })
+  }
+
+  const totalWorked = todayAtt?.total_hours
+    ? `${todayAtt.total_hours}h worked`
+    : isIn && todayAtt?.clock_in
+      ? `Since ${format(new Date(todayAtt.clock_in), 'h:mm a')}`
+      : ''
+
+  return (
+    <Card className="overflow-hidden border-border/70 shadow-xs">
+      <div className="bg-gradient-to-br from-sidebar to-sidebar/80 p-6">
+        <div className="text-center">
+          <div className="flex justify-center mb-3">
+            <Badge
+              className={`px-3 py-1 text-[11px] font-semibold gap-1.5 shadow-xs ${
+                isGeofenceActive
+                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
+                  : 'bg-amber-500/20 text-amber-300 border-amber-500/30'
+              }`}
+            >
+              {isGeofenceActive ? <ShieldCheck className="size-3 text-emerald-400" /> : <Globe className="size-3 text-amber-400" />}
+              {isGeofenceActive
+                ? `Geofence Enforced (${geofenceSettings?.radius || 100}m)`
+                : 'Remote / Field Clock-in (Geofence OFF)'}
+            </Badge>
+          </div>
+
+          <div className="text-5xl font-bold tabular-nums tracking-tight text-sidebar-foreground">
+            {format(time, 'HH:mm:ss')}
+          </div>
+          <div className="mt-1 text-sm text-sidebar-foreground/60 mb-2">
+            {format(time, 'EEEE, MMMM d, yyyy')}
+          </div>
+
+          {(() => {
+            const todayHoliday = getHolidayForDate(time)
+            if (!todayHoliday) return null
+            return (
+              <div className="mb-4 inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-rose-500/20 text-rose-200 border border-rose-500/40 shadow-xs">
+                <span>🇵🇭</span>
+                <span className="truncate max-w-[260px]">{todayHoliday.name}</span>
+                <span className="text-[10px] opacity-80 font-normal">
+                  ({todayHoliday.type === 'regular' ? '200% Double Pay' : '130% Premium'})
+                </span>
+              </div>
+            )
+          })()}
+
+          {permissionsGranted && !isDone && (
+            <div className="mx-auto max-w-sm rounded-xl overflow-hidden bg-white/5 p-2 shadow-sm border border-white/10">
+              <LiveGeofenceMap userLocation={userLocation} userAccuracy={liveGpsAccuracy} />
+            </div>
+          )}
+
+          <div className="mt-5 flex justify-center">
+            {isDone ? (
+              <div className="flex items-center gap-2 rounded-full bg-white/10 px-5 sm:px-6 py-2.5">
+                <CheckCircle className="size-4 sm:size-5 text-emerald-400" />
+                <span className="text-xs sm:text-sm font-medium text-sidebar-foreground">
+                  Shift complete · {todayAtt?.total_hours}h
+                </span>
+              </div>
+            ) : permissionsGranted ? (
+              <Button
+                size="lg"
+                onClick={handleClockClick}
+                disabled={clockIn.isPending || clockOut.isPending || isAcquiringGps}
+                className={`rounded-full w-full max-w-[280px] sm:w-auto h-12 text-sm sm:text-base font-semibold px-8 shadow-md transition-transform active:scale-95 ${
+                  isIn ? 'bg-rose-500 hover:bg-rose-600 text-white' : 'bg-primary hover:bg-primary/90 text-primary-foreground'
+                }`}
+              >
+                {isAcquiringGps ? (
+                  <Loader2 className="mr-2 size-5 animate-spin" />
+                ) : (
+                  <Clock className="mr-2 size-5" />
+                )}
+                {isAcquiringGps ? 'Verifying GPS...' : isIn ? 'Clock Out' : 'Clock In'}
+              </Button>
+            ) : (
+              <Button
+                size="lg"
+                onClick={requestPermissions}
+                disabled={checkingPermissions}
+                className="rounded-full w-full max-w-[280px] sm:w-auto h-12 text-sm sm:text-base font-semibold px-8 bg-primary hover:bg-primary/90 text-primary-foreground shadow-md transition-transform active:scale-95"
+              >
+                {checkingPermissions ? <Loader2 className="mr-2 size-5 animate-spin" /> : <Clock className="mr-2 size-5" />}
+                Allow GPS & Camera to Clock In
+              </Button>
+            )}
+          </div>
+
+          {totalWorked && (
+            <p className="mt-3 text-xs text-sidebar-foreground/50">{totalWorked}</p>
+          )}
+        </div>
+      </div>
+      <CardContent className="p-4">
+        <div className="grid grid-cols-2 gap-4 text-center">
+          <div className="rounded-lg bg-muted/50 p-3">
+            <p className="text-xs text-muted-foreground">Clock In</p>
+            <p className="mt-1 text-lg font-semibold">
+              {todayAtt?.clock_in ? format(new Date(todayAtt.clock_in), 'h:mm a') : '--:--'}
+            </p>
+          </div>
+          <div className="rounded-lg bg-muted/50 p-3">
+            <p className="text-xs text-muted-foreground">Clock Out</p>
+            <p className="mt-1 text-lg font-semibold">
+              {todayAtt?.clock_out ? format(new Date(todayAtt.clock_out), 'h:mm a') : '--:--'}
+            </p>
+          </div>
+        </div>
+      </CardContent>
+
+      {/* FACIAL IDENTITY VERIFICATION DIALOG */}
+      <Dialog open={showFaceVerification} onOpenChange={setShowFaceVerification}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Camera className="size-5 text-primary" />
+              Facial Identity & GPS Verification
+            </DialogTitle>
+            <DialogDescription className="space-y-1.5 pt-1 text-xs">
+              <p>Align your face inside the camera frame for biometric identity matching.</p>
+              <div className="flex items-center gap-1.5 rounded-md bg-blue-500/10 border border-blue-500/20 px-2.5 py-1 text-[11px] font-medium text-blue-700 dark:text-blue-300">
+                <span>🛰️</span>
+                <span>
+                  High-Precision GPS Lock Required (≤35m margin)
+                  {liveGpsAccuracy !== null && ` • Current: ±${liveGpsAccuracy}m`}
+                </span>
+              </div>
+            </DialogDescription>
+          </DialogHeader>
+          <div className="py-2">
+            <WebcamCapture onCapture={handleFaceVerify} isLoading={isVerifying} />
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* STRICT GPS INACCURACY / REPETITION ALERT DIALOG */}
+      <AlertDialog open={!!gpsFailureDetails} onOpenChange={(open) => !open && setGpsFailureDetails(null)}>
+        <AlertDialogContent className="border-rose-500/40 bg-card sm:max-w-md">
+          <AlertDialogHeader>
+            <div className="mx-auto flex size-12 items-center justify-center rounded-full bg-rose-500/10 text-rose-600 mb-2">
+              <ShieldAlert className="size-6" />
+            </div>
+            <AlertDialogTitle className="text-center text-lg font-bold text-rose-600">
+              {gpsFailureDetails?.title || 'GPS Verification Failed'}
+            </AlertDialogTitle>
+            <AlertDialogDescription className="text-center text-xs sm:text-sm text-muted-foreground space-y-3 pt-1">
+              <p className="font-medium text-foreground">{gpsFailureDetails?.message}</p>
+              
+              <div className="rounded-lg border border-rose-200 bg-rose-50/80 dark:border-rose-900/40 dark:bg-rose-950/40 p-3 text-left space-y-1.5 text-xs text-rose-900 dark:text-rose-200 font-medium">
+                <div className="font-bold flex items-center gap-1.5 text-rose-700 dark:text-rose-300">
+                  <AlertTriangle className="size-3.5 shrink-0" />
+                  Mandatory Verification Policy:
+                </div>
+                <p className="text-[11px] leading-relaxed">
+                  Your clock-in was <strong>not accepted</strong> because the GPS location was inaccurate or outside the boundary. 
+                  To ensure record validity, you must <strong>repeat the entire process</strong> (both Face Verification and GPS Location Verification).
+                </p>
+              </div>
+
+              <div className="text-[11px] text-muted-foreground space-y-0.5 text-left bg-muted/40 p-2.5 rounded-md border">
+                <p className="font-semibold text-foreground">Tips for an accurate GPS lock:</p>
+                <ul className="list-disc list-inside space-y-0.5">
+                  <li>Ensure device location mode is set to <strong>High Accuracy</strong></li>
+                  <li>Step outdoors or near a window with a clear view of the sky</li>
+                  <li>Turn off mock location apps or VPNs</li>
+                </ul>
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter className="sm:justify-center pt-2">
+            <AlertDialogAction 
+              onClick={() => setGpsFailureDetails(null)}
+              className="bg-primary hover:bg-primary/90 text-primary-foreground font-semibold px-6 w-full sm:w-auto"
+            >
+              Repeat Clock-In Process
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </Card>
+  )
+}
+
+// ================= OFFICIAL DOLE DTR DIALOG =================
+function DOLEDTRDialog({
+  open,
+  onOpenChange,
+  employee,
+  records,
+  monthDate,
+  schedules,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  employee: Employee | null
+  records: AttendanceRecord[]
+  monthDate: Date
+  schedules?: any[]
+}) {
+  const printableRef = useRef<HTMLDivElement>(null)
+  if (!employee) return null
+
+  const handlePrint = () => {
+    if (printableRef.current) {
+      printHtmlElement(printableRef.current, {
+        title: `DTR Form 48 - ${employee.first_name} ${employee.last_name} - ${format(monthDate, 'MMMM yyyy')}`,
+        pageStyle: `@page { size: portrait; margin: 8mm; }`,
+      })
+    } else {
+      window.print()
+    }
+  }
+
+  // Days in month
+  const year = monthDate.getFullYear()
+  const month = monthDate.getMonth()
+  const daysInMonth = new Date(year, month + 1, 0).getDate()
+  const baseHourlyRate = Number((employee.salary_info as any)?.hourly_rate) || 250
+
+  const recordsMap = new Map<number, AttendanceRecord>()
+  records.forEach(r => {
+    const d = new Date(r.date).getDate()
+    recordsMap.set(d, r)
+  })
+
+  let totalRegularHours = 0
+  let totalOvertimeHours = 0
+  let totalTardinessMinutes = 0
+  let totalUndertimeMinutes = 0
+  let totalComplianceDeduction = 0
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-4xl max-h-[90vh] overflow-y-auto">
+        <DialogHeader className="no-print">
+          <DialogTitle>Official Daily Time Record (Civil Service Form 48 / DOLE)</DialogTitle>
+          <DialogDescription>
+            Official monthly attendance and timecard log for statutory auditing with schedule compliance tracking.
+          </DialogDescription>
+        </DialogHeader>
+
+        {/* Printable DTR Layout */}
+        <div ref={printableRef} className="print-area p-6 bg-white text-black font-sans rounded-xl border print:border-none print:p-0">
+          <div className="text-center space-y-1 pb-4 border-b border-black">
+            <h2 className="text-xs font-bold uppercase tracking-widest text-gray-700">Civil Service Form No. 48 / DOLE Compliant</h2>
+            <h1 className="text-xl font-black uppercase tracking-wider">PRIORITY HANDLING LOGISTICS, INC.</h1>
+            <p className="text-sm font-bold uppercase">DAILY TIME RECORD (DTR)</p>
+            <p className="text-xs font-semibold">For the Month of: {format(monthDate, 'MMMM yyyy')}</p>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4 py-3 text-xs border-b border-black">
+            <div>
+              <p><span className="font-bold">NAME:</span> {employee.first_name} {employee.last_name}</p>
+              <p><span className="font-bold">EMPLOYEE ID:</span> {employee.employee_id || employee.id.split('-')[0].toUpperCase()}</p>
+              <p><span className="font-bold">HOURLY RATE:</span> ₱{baseHourlyRate.toFixed(2)}/hr (₱{(baseHourlyRate / 60).toFixed(2)}/min)</p>
+            </div>
+            <div className="text-right">
+              <p><span className="font-bold">POSITION:</span> {employee.position || 'Employee'}</p>
+              <p><span className="font-bold">DEPARTMENT:</span> {employee.departments?.name || 'Operations'}</p>
+              <p><span className="font-bold">STANDARD SCHEDULE:</span> 09:00 AM – 05:00 PM (Mon–Fri)</p>
+            </div>
+          </div>
+
+          <div className="py-2 overflow-x-auto">
+            <table className="w-full text-center text-[11px] border-collapse border border-black">
+              <thead>
+                <tr className="bg-gray-100 font-bold border-b border-black">
+                  <th rowSpan={2} className="border border-black p-1 w-10">Day</th>
+                  <th colSpan={2} className="border border-black p-1">A.M.</th>
+                  <th colSpan={2} className="border border-black p-1">P.M.</th>
+                  <th colSpan={2} className="border border-black p-1">Hours</th>
+                  <th colSpan={2} className="border border-black p-1">Schedule Penalty</th>
+                  <th rowSpan={2} className="border border-black p-1">Status / Remarks</th>
+                </tr>
+                <tr className="bg-gray-50 font-semibold border-b border-black text-[10px]">
+                  <th className="border border-black p-1">Arrival</th>
+                  <th className="border border-black p-1">Departure</th>
+                  <th className="border border-black p-1">Arrival</th>
+                  <th className="border border-black p-1">Departure</th>
+                  <th className="border border-black p-1">Regular</th>
+                  <th className="border border-black p-1">Overtime</th>
+                  <th className="border border-black p-1">Late / Early</th>
+                  <th className="border border-black p-1">Deduction</th>
+                </tr>
+              </thead>
+              <tbody>
+                {Array.from({ length: daysInMonth }).map((_, idx) => {
+                  const dayNum = idx + 1
+                  const record = recordsMap.get(dayNum)
+                  const dayDate = new Date(year, month, dayNum)
+                  const dayDateStr = format(dayDate, 'yyyy-MM-dd')
+                  const dayName = format(dayDate, 'EEE')
+                  const isWeekend = dayDate.getDay() === 0 || dayDate.getDay() === 6
+                  const holiday = getHolidayForDate(dayDate)
+
+                  const clockIn = record?.clock_in ? format(new Date(record.clock_in), 'h:mm a') : ''
+                  const clockOut = record?.clock_out ? format(new Date(record.clock_out), 'h:mm a') : ''
+                  const hours = record?.total_hours || 0
+                  const ot = record?.overtime_hours || (hours > 8 ? hours - 8 : 0)
+                  const reg = Math.min(8, hours)
+
+                  if (hours > 0) {
+                    totalRegularHours += reg
+                    totalOvertimeHours += ot
+                  }
+
+                  // Find assigned schedule
+                  const sched = schedules?.find(s => s.employee_id === employee.id && s.date === dayDateStr)
+                  const compliance = calculateScheduleCompliance({
+                    scheduledStart: sched?.shifts?.start_time || '09:00',
+                    scheduledEnd: sched?.shifts?.end_time || '17:00',
+                    clockIn: record?.clock_in,
+                    clockOut: record?.clock_out,
+                    hourlyRate: baseHourlyRate,
+                    isOvernight: !!sched?.shifts?.is_overnight,
+                    gracePeriodMins: sched?.shifts?.grace_period_mins || 0,
+                  })
+
+                  if (compliance.isLate) totalTardinessMinutes += compliance.tardinessMinutes
+                  if (compliance.isUndertime) totalUndertimeMinutes += compliance.undertimeMinutes
+                  totalComplianceDeduction += compliance.totalDeduction
+
+                  let statusText = record ? record.status.toUpperCase() : isWeekend ? 'OFF' : 'ABSENT'
+                  if (holiday) {
+                    if (hours > 0) {
+                      statusText = `HOLIDAY WORKED (${holiday.type === 'regular' ? '200%' : '130%'})`
+                    } else {
+                      statusText = `HOLIDAY (${holiday.type === 'regular' ? 'PAID 100%' : 'UNPAID'})`
+                    }
+                  }
+
+                  return (
+                    <tr 
+                      key={dayNum} 
+                      className={`border-b border-black/30 ${
+                        holiday 
+                          ? holiday.type === 'regular' ? 'bg-blue-50 font-semibold' : 'bg-amber-50 font-semibold' 
+                          : isWeekend 
+                          ? 'bg-gray-50 font-semibold' 
+                          : ''
+                      }`}
+                    >
+                      <td className="border border-black p-0.5 font-bold text-left pl-1">
+                        {dayNum} ({dayName})
+                        {holiday && (
+                          <span className="ml-1 text-[9px] text-rose-700 font-extrabold" title={`${holiday.name} (${holiday.type})`}>
+                            🚩 {holiday.type === 'regular' ? 'REG' : 'SPEC'}
+                          </span>
+                        )}
+                      </td>
+                      <td className="border border-black p-0.5">{clockIn ? clockIn : isWeekend || holiday ? '—' : ''}</td>
+                      <td className="border border-black p-0.5">{hours > 0 ? '12:00 PM' : '—'}</td>
+                      <td className="border border-black p-0.5">{hours > 0 ? '1:00 PM' : '—'}</td>
+                      <td className="border border-black p-0.5">{clockOut ? clockOut : isWeekend || holiday ? '—' : ''}</td>
+                      <td className="border border-black p-0.5 font-mono">{reg > 0 ? `${reg.toFixed(1)}h` : '—'}</td>
+                      <td className="border border-black p-0.5 font-mono">{ot > 0 ? `${ot.toFixed(1)}h` : '—'}</td>
+                      <td className="border border-black p-0.5 text-[10px]">
+                        {compliance.isLate || compliance.isUndertime ? (
+                          <span className="text-amber-800 font-bold">
+                            {compliance.isLate ? `L:${compliance.tardinessMinutes}m ` : ''}
+                            {compliance.isUndertime ? `E:${compliance.undertimeMinutes}m` : ''}
+                          </span>
+                        ) : hours > 0 ? (
+                          <span className="text-emerald-700 font-semibold">On-time</span>
+                        ) : '—'}
+                      </td>
+                      <td className="border border-black p-0.5 font-mono text-[10px] text-red-700 font-bold">
+                        {compliance.totalDeduction > 0 ? `-${formatPHP(compliance.totalDeduction)}` : '—'}
+                      </td>
+                      <td className="border border-black p-0.5 text-[9px] font-medium">
+                        {statusText}
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+              <tfoot>
+                <tr className="bg-gray-100 font-bold border-t-2 border-black text-xs">
+                  <td colSpan={5} className="border border-black p-1 text-right">TOTAL HOURS & DEDUCTIONS:</td>
+                  <td className="border border-black p-1 font-mono">{totalRegularHours.toFixed(1)}h</td>
+                  <td className="border border-black p-1 font-mono">{totalOvertimeHours.toFixed(1)}h</td>
+                  <td className="border border-black p-1 text-[10px] text-amber-800 font-bold">
+                    {totalTardinessMinutes > 0 || totalUndertimeMinutes > 0 ? `${totalTardinessMinutes}m L / ${totalUndertimeMinutes}m E` : 'None'}
+                  </td>
+                  <td className="border border-black p-1 font-mono text-red-700 font-bold">
+                    {totalComplianceDeduction > 0 ? `-${formatPHP(totalComplianceDeduction)}` : '₱0.00'}
+                  </td>
+                  <td className="border border-black p-1 font-mono font-bold">{(totalRegularHours + totalOvertimeHours).toFixed(1)}h Net</td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+
+          <div className="pt-8 grid grid-cols-2 gap-8 text-xs text-center">
+            <div className="border-t border-black pt-2">
+              <p className="font-bold">{employee.first_name} {employee.last_name}</p>
+              <p className="text-[10px] text-gray-600">Employee Signature</p>
+            </div>
+            <div className="border-t border-black pt-2">
+              <p className="font-bold">Authorized HR / Operations Supervisor</p>
+              <p className="text-[10px] text-gray-600">Verified & Approved</p>
+            </div>
+          </div>
+        </div>
+
+        <DialogFooter className="no-print">
+          <Button variant="outline" onClick={() => onOpenChange(false)}>Close</Button>
+          <Button onClick={handlePrint} className="gap-1.5">
+            <Printer className="size-4" /> Print Form 48 DTR
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// ================= MAIN ATTENDANCE PAGE =================
+export default function AttendancePage() {
+  const { employee } = useAuthStore()
+  const { can } = usePermissions()
+  const [selectedDate, setSelectedDate] = useState<Date>(new Date())
+  const [calendarMonth, setCalendarMonth] = useState<Date>(new Date())
+  const [statusFilter, setStatusFilter] = useState<string | null>(null)
+  const [deptFilter, setDeptFilter] = useState<string>('all')
+  const [search, setSearch] = useState<string>('')
+  
+  // Geofence settings state
+  const [geofenceSettings, setGeofenceSettings] = useState<GeofenceState | null>(null)
+  const [togglingGeofence, setTogglingGeofence] = useState(false)
+
+  // Manual Attendance Record Modal State
+  const [manualRecordOpen, setManualRecordOpen] = useState(false)
+  const [manualForm, setManualForm] = useState({
+    id: '',
+    employee_id: '',
+    date: format(new Date(), 'yyyy-MM-dd'),
+    clock_in_time: '08:00',
+    clock_out_time: '17:00',
+    status: 'present',
+    notes: '',
+  })
+
+  // DTR Dialog State
+  const [dtrEmployee, setDtrEmployee] = useState<Employee | null>(null)
+
+  // Delete Attendance State
+  const [deleteRecordId, setDeleteRecordId] = useState<string | null>(null)
+
+  const { data: employees } = useEmployees()
+  const { data: departments } = useDepartments()
+  const { data: todayAttendance, isLoading } = useAttendance(selectedDate)
+  
+  const { data: monthAttendance } = useAttendanceRange(
+    format(startOfMonth(calendarMonth), 'yyyy-MM-dd'),
+    format(endOfMonth(calendarMonth), 'yyyy-MM-dd')
+  )
+
+  const { data: daySchedules } = useSchedules(format(selectedDate, 'yyyy-MM-dd'), format(selectedDate, 'yyyy-MM-dd'))
+  const { data: monthSchedules } = useSchedules(
+    format(startOfMonth(calendarMonth), 'yyyy-MM-dd'),
+    format(endOfMonth(calendarMonth), 'yyyy-MM-dd')
+  )
+
+  const manualMutation = useManualAttendanceRecord()
+  const deleteMutation = useDeleteAttendanceRecord()
+
+  // Fetch geofence configuration
+  useEffect(() => {
+    const fetchGeofence = async () => {
+      try {
+        const { data, error } = await supabase
+          .from('organizations')
+          .select('geofence_settings')
+          .eq('id', ORG_ID)
+          .maybeSingle()
+
+        if (error) throw error
+        if (data?.geofence_settings) {
+          const s = data.geofence_settings as any
+          setGeofenceSettings({
+            lat: s.lat ?? 14.5995,
+            lng: s.lng ?? 120.9842,
+            radius: s.radius ?? 100,
+            enabled: s.enabled !== false,
+          })
+        } else {
+          setGeofenceSettings({
+            lat: 14.5995,
+            lng: 120.9842,
+            radius: 100,
+            enabled: true,
+          })
+        }
+      } catch (err) {
+        console.warn('Error loading geofence settings:', err)
+      }
+    }
+    fetchGeofence()
+  }, [])
+
+  // HR Manager / Admin toggle geofence enforcement
+  const handleToggleGeofence = async (newEnabled: boolean) => {
+    setTogglingGeofence(true)
+    try {
+      const current = geofenceSettings || { lat: 14.5995, lng: 120.9842, radius: 100, enabled: true }
+      const updated = { ...current, enabled: newEnabled }
+
+      const { error } = await supabase
+        .from('organizations')
+        .update({ geofence_settings: updated })
+        .eq('id', ORG_ID)
+
+      if (error) throw error
+      setGeofenceSettings(updated)
+
+      if (newEnabled) {
+        toast.success('🛡️ Geofence Enforcement Enabled', {
+          description: `Employees must be within ${updated.radius}m of the hub to clock in.`
+        })
+      } else {
+        toast.info('🌐 Geofence Enforcement Disabled', {
+          description: 'Employees can now clock in from any remote or field location.'
+        })
+      }
+    } catch (err: any) {
+      toast.error('Failed to update geofence: ' + err.message)
+    } finally {
+      setTogglingGeofence(false)
+    }
+  }
+
+  const isGeofenceActive = geofenceSettings?.enabled !== false
+
+  // Open Manual Entry
+  const openManualCreate = () => {
+    setManualForm({
+      id: '',
+      employee_id: employees?.[0]?.id || '',
+      date: format(selectedDate, 'yyyy-MM-dd'),
+      clock_in_time: '08:00',
+      clock_out_time: '17:00',
+      status: 'present',
+      notes: '',
+    })
+    setManualRecordOpen(true)
+  }
+
+  const openManualEdit = (record: AttendanceRecord) => {
+    const inTime = record.clock_in ? format(new Date(record.clock_in), 'HH:mm') : '08:00'
+    const outTime = record.clock_out ? format(new Date(record.clock_out), 'HH:mm') : '17:00'
+
+    setManualForm({
+      id: record.id,
+      employee_id: record.employee_id,
+      date: record.date,
+      clock_in_time: inTime,
+      clock_out_time: outTime,
+      status: record.status,
+      notes: record.notes || '',
+    })
+    setManualRecordOpen(true)
+  }
+
+  const handleSaveManualRecord = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!manualForm.employee_id) {
+      toast.error('Please select an employee')
+      return
+    }
+
+    try {
+      const clockInISO = manualForm.clock_in_time 
+        ? `${manualForm.date}T${manualForm.clock_in_time}:00` 
+        : null
+      const clockOutISO = manualForm.clock_out_time 
+        ? `${manualForm.date}T${manualForm.clock_out_time}:00` 
+        : null
+
+      let totalHours = 0
+      if (clockInISO && clockOutISO) {
+        const diff = new Date(clockOutISO).getTime() - new Date(clockInISO).getTime()
+        totalHours = Math.max(0, parseFloat((diff / 3600000 - 1).toFixed(2)))
+      }
+
+      await manualMutation.mutateAsync({
+        id: manualForm.id || undefined,
+        employee_id: manualForm.employee_id,
+        date: manualForm.date,
+        clock_in: clockInISO,
+        clock_out: clockOutISO,
+        total_hours: totalHours,
+        overtime_hours: Math.max(0, totalHours - 8),
+        status: manualForm.status,
+        notes: manualForm.notes || null,
+      })
+
+      toast.success(manualForm.id ? 'Attendance record updated!' : 'Manual attendance logged!')
+      setManualRecordOpen(false)
+    } catch (err: any) {
+      toast.error('Failed to save attendance record: ' + err.message)
+    }
+  }
+
+  const handleDeleteRecord = async () => {
+    if (!deleteRecordId) return
+    try {
+      await deleteMutation.mutateAsync(deleteRecordId)
+      toast.success('Attendance record deleted')
+      setDeleteRecordId(null)
+    } catch (err: any) {
+      toast.error('Delete failed: ' + err.message)
+    }
+  }
+
+  // Summary Metrics
+  const summary = useMemo(() => {
+    if (!todayAttendance) return { present: 0, late: 0, absent: 0, missingClockOut: 0, holiday: 0, total: 0 }
+    return {
+      present: todayAttendance.filter(a => a.status === 'present').length,
+      late: todayAttendance.filter(a => a.status === 'late').length,
+      absent: todayAttendance.filter(a => a.status === 'absent').length,
+      missingClockOut: todayAttendance.filter(a => a.clock_in && !a.clock_out).length,
+      holiday: todayAttendance.filter(a => a.status === 'holiday').length,
+      total: todayAttendance.length,
+    }
+  }, [todayAttendance])
+
+  // Philippine Holiday for currently inspected date and month
+  const selectedDateHoliday = useMemo(() => getHolidayForDate(selectedDate), [selectedDate])
+  const selectedMonthHolidays = useMemo(() => getHolidaysForMonth(calendarMonth.getFullYear(), calendarMonth.getMonth()), [calendarMonth])
+
+  // Filtered attendance records
+  const filteredAttendance = useMemo(() => {
+    if (!todayAttendance) return []
+    return todayAttendance.filter(a => {
+      const empName = `${a.employees?.first_name || ''} ${a.employees?.last_name || ''}`.toLowerCase()
+      const matchSearch = !search || empName.includes(search.toLowerCase())
+      
+      const matchStatus = !statusFilter || (
+        statusFilter === 'missing_out' ? (a.clock_in && !a.clock_out) : a.status === statusFilter
+      )
+
+      const deptName = a.employees?.departments?.name || ''
+      const matchDept = deptFilter === 'all' || deptName.toLowerCase() === deptFilter.toLowerCase()
+
+      return matchSearch && matchStatus && matchDept
+    })
+  }, [todayAttendance, statusFilter, deptFilter, search])
+
+  // Monthly Aggregation
+  const monthlySummary = useMemo(() => {
+    if (!monthAttendance) return []
+    const summaryMap = new Map<string, { employee: any, present: number, late: number, absent: number, half_day: number, holiday: number, totalHours: number, records: AttendanceRecord[] }>()
+    
+    monthAttendance.forEach(record => {
+      const empId = record.employee_id
+      if (!summaryMap.has(empId)) {
+        summaryMap.set(empId, {
+          employee: record.employees,
+          present: 0,
+          late: 0,
+          absent: 0,
+          half_day: 0,
+          holiday: 0,
+          totalHours: 0,
+          records: [],
+        })
+      }
+      const stats = summaryMap.get(empId)!
+      stats.records.push(record)
+      if (record.status === 'present') stats.present++
+      if (record.status === 'late') stats.late++
+      if (record.status === 'absent') stats.absent++
+      if (record.status === 'half_day') stats.half_day++
+      if (record.status === 'holiday' || (getHolidayForDate(record.date) && record.total_hours && record.total_hours > 0)) stats.holiday++
+      if (record.total_hours) stats.totalHours += record.total_hours
+    })
+  
+    return Array.from(summaryMap.values()).sort((a, b) => {
+      const nameA = a.employee?.first_name || ''
+      const nameB = b.employee?.first_name || ''
+      return nameA.localeCompare(nameB)
+    })
+  }, [monthAttendance])
+
+  return (
+    <div className="space-y-6">
+      {/* Official DOLE DTR Dialog */}
+      <DOLEDTRDialog
+        open={!!dtrEmployee}
+        onOpenChange={(op) => !op && setDtrEmployee(null)}
+        employee={dtrEmployee}
+        records={monthAttendance?.filter(r => r.employee_id === dtrEmployee?.id) || []}
+        monthDate={calendarMonth}
+      />
+
+      {/* Top Header & HR Attendance Controls */}
+      <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight">Attendance & Timekeeping Management</h1>
+          <p className="text-sm text-muted-foreground">
+            Monitor real-time biometric timecards, GPS spatial bounds, and DOLE Form 48 Daily Time Records
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2.5 flex-wrap">
+          {/* Quick Geofence Switch */}
+          {can.manageAttendance() && (
+            <div className={`flex items-center gap-2.5 px-3 py-1.5 rounded-lg border transition-all ${
+              isGeofenceActive 
+                ? 'bg-emerald-50/80 border-emerald-200 dark:bg-emerald-950/30 dark:border-emerald-900/60' 
+                : 'bg-amber-50/80 border-amber-200 dark:bg-amber-950/30 dark:border-amber-900/60'
+            }`}>
+              <div className="flex flex-col">
+                <span className="text-[10px] uppercase font-bold text-muted-foreground">Geofence Lock</span>
+                <span className={`text-xs font-semibold ${isGeofenceActive ? 'text-emerald-700 dark:text-emerald-300' : 'text-amber-700 dark:text-amber-300'}`}>
+                  {isGeofenceActive ? 'Active (Strict)' : 'Bypassed (Remote)'}
+                </span>
+              </div>
+              <Switch
+                id="hr-geofence-toggle"
+                checked={isGeofenceActive}
+                onCheckedChange={handleToggleGeofence}
+                disabled={togglingGeofence}
+                title="Toggle Geofence on/off to allow or restrict remote clock-ins"
+              />
+            </div>
+          )}
+
+          {can.manageAttendance() && (
+            <Button variant="outline" className="gap-1.5" onClick={openManualCreate}>
+              <PlusCircle className="size-4" />
+              Manual Timecard
+            </Button>
+          )}
+
+          {can.manageAttendance() && (
+            <Button 
+              variant="outline" 
+              className="gap-1.5"
+              onClick={() => {
+                if (!todayAttendance || todayAttendance.length === 0) {
+                  toast.error('No records to export')
+                  return
+                }
+                const exportData = todayAttendance.map(record => ({
+                  Date: record.date,
+                  Employee: `${record.employees?.first_name} ${record.employees?.last_name}`,
+                  Department: record.employees?.departments?.name || 'Operations',
+                  Status: record.status.toUpperCase(),
+                  'Clock In': record.clock_in ? format(new Date(record.clock_in), 'h:mm a') : '',
+                  'Clock Out': record.clock_out ? format(new Date(record.clock_out), 'h:mm a') : '',
+                  'Total Hours': record.total_hours || 0,
+                  'Overtime Hours': record.overtime_hours || 0,
+                  Notes: record.notes || '',
+                }))
+                downloadCSV(exportData, `Attendance_Log_${format(selectedDate, 'yyyy-MM-dd')}`)
+                toast.success('Attendance report exported to CSV')
+              }}
+            >
+              <Download className="size-4" />
+              Export Today
+            </Button>
+          )}
+        </div>
+      </div>
+
+      {/* Philippine Holiday Statutory Alert Banner */}
+      {selectedDateHoliday && (
+        <div className="rounded-xl border border-rose-200 bg-rose-50/80 p-3.5 text-xs dark:border-rose-900/60 dark:bg-rose-950/30 space-y-2 shadow-2xs">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2.5">
+              <span className="flex size-7 items-center justify-center rounded-lg bg-rose-600 text-white font-bold text-xs shadow-2xs shrink-0">
+                🇵🇭
+              </span>
+              <div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-bold text-foreground text-sm">
+                    {selectedDateHoliday.name} {selectedDateHoliday.localName && <span className="font-normal text-muted-foreground">({selectedDateHoliday.localName})</span>}
+                  </span>
+                  <Badge 
+                    className={`text-[10px] font-bold px-2 py-0.5 ${
+                      selectedDateHoliday.type === 'regular'
+                        ? 'bg-blue-600 text-white hover:bg-blue-700'
+                        : 'bg-amber-600 text-white hover:bg-amber-700'
+                    }`}
+                  >
+                    {selectedDateHoliday.type === 'regular' ? '🟢 Regular Holiday (Paid 100%)' : '🟡 Special Non-Working (130% Worked)'}
+                  </Badge>
+                </div>
+                <p className="text-[11px] text-muted-foreground mt-0.5">
+                  {selectedDateHoliday.description} • Legal Basis: <span className="italic">{selectedDateHoliday.legalBasis}</span>
+                </p>
+              </div>
+            </div>
+            <div className="text-right shrink-0">
+              <span className="text-[11px] font-bold text-rose-800 dark:text-rose-300">
+                {selectedDateHoliday.type === 'regular' 
+                  ? '🟢 Unworked: 100% Paid • Worked: 200% Double Pay' 
+                  : '🟡 Unworked: Unpaid ("No Work, No Pay") • Worked: 130%'}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Main Grid: Clock In Widget + Today's Summary & Roster */}
+      <div className="grid gap-6 lg:grid-cols-3">
+        {/* Clock widget */}
+        <ClockWidget geofenceSettings={geofenceSettings} />
+
+        {/* Today's summary & Roster */}
+        <Card className="lg:col-span-2 border-border/70 shadow-xs flex flex-col">
+          <CardHeader className="pb-3">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div>
+                <CardTitle className="text-base flex items-center gap-2">
+                  {isSameDay(selectedDate, new Date()) ? "Today's Verified Attendance" : "Daily Attendance Roster"}
+                  {selectedDateHoliday && (
+                    <Badge variant="outline" className="text-[10px] border-rose-300 bg-rose-50 text-rose-800 dark:bg-rose-950 dark:text-rose-300">
+                      🇵🇭 {selectedDateHoliday.name}
+                    </Badge>
+                  )}
+                </CardTitle>
+                <CardDescription>{format(selectedDate, 'EEEE, MMMM d, yyyy')}</CardDescription>
+              </div>
+              <div className="flex items-center gap-2">
+                <Badge variant="secondary" className="tabular-nums font-semibold">
+                  {summary.total} Tracked Records
+                </Badge>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4 flex-1 flex flex-col">
+            {/* KPI Stat Pills */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+              {[
+                { label: 'Present', id: 'present', value: summary.present, color: 'text-emerald-600', bg: 'bg-emerald-50 dark:bg-emerald-950/30 ring-emerald-500' },
+                { label: 'Late / Tardy', id: 'late', value: summary.late, color: 'text-amber-600', bg: 'bg-amber-50 dark:bg-amber-950/30 ring-amber-500' },
+                { label: 'Absent', id: 'absent', value: summary.absent, color: 'text-red-600', bg: 'bg-red-50 dark:bg-red-950/30 ring-red-500' },
+                { 
+                  label: 'Missing Clock-Out', 
+                  id: 'missing_out', 
+                  value: summary.missingClockOut, 
+                  color: summary.missingClockOut > 0 ? 'text-rose-600' : 'text-muted-foreground',
+                  bg: summary.missingClockOut > 0 ? 'bg-rose-50 dark:bg-rose-950/40 ring-rose-500' : 'bg-muted/40'
+                },
+              ].map((s) => (
+                <div 
+                  key={s.label} 
+                  onClick={() => setStatusFilter(statusFilter === s.id ? null : s.id)}
+                  className={`rounded-xl p-3 text-center cursor-pointer transition-all hover:ring-2 ${statusFilter === s.id ? 'ring-2 shadow-xs' : ''} ${s.bg}`}
+                >
+                  <p className={`text-2xl font-bold ${s.color}`}>{s.value}</p>
+                  <p className="text-[11px] text-muted-foreground font-medium">{s.label}</p>
+                </div>
+              ))}
+            </div>
+
+            {/* Quick Search & Department Filter */}
+            <div className="flex items-center gap-2">
+              <div className="relative flex-1">
+                <Search className="absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  placeholder="Filter by name..."
+                  value={search}
+                  onChange={e => setSearch(e.target.value)}
+                  className="pl-8 h-8 text-xs"
+                />
+              </div>
+
+              <Select value={deptFilter} onValueChange={setDeptFilter}>
+                <SelectTrigger className="w-[140px] h-8 text-xs">
+                  <Building2 className="mr-1 size-3 text-muted-foreground" />
+                  <SelectValue placeholder="Department" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All Depts</SelectItem>
+                  {departments?.map(d => (
+                    <SelectItem key={d.id} value={d.name}>{d.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* Live Attendance List */}
+            <div className="space-y-2 max-h-72 overflow-y-auto pr-1 flex-1">
+              {isLoading ? (
+                Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-14 w-full rounded-lg" />)
+              ) : filteredAttendance.length === 0 ? (
+                <div className="py-12 text-center text-muted-foreground border border-dashed rounded-xl">
+                  <Clock className="size-8 mx-auto text-muted-foreground/40 mb-1.5" />
+                  <p className="text-sm font-semibold">No attendance records logged for this filter</p>
+                  <p className="text-xs">Adjust the filter pills or create a manual entry.</p>
+                </div>
+              ) : (
+                filteredAttendance.map((record) => {
+                  const cfg = ATT_STATUS_CONFIG[record.status] || ATT_STATUS_CONFIG.present
+                  const Icon = cfg.icon
+                  const recHoliday = getHolidayForDate(record.date)
+
+                  // Match schedule compliance
+                  const sched = daySchedules?.find(s => s.employee_id === record.employee_id)
+                  const baseRate = Number((record.employees?.salary_info as any)?.hourly_rate) || 250
+                  const compliance = calculateScheduleCompliance({
+                    scheduledStart: sched?.shifts?.start_time || '09:00',
+                    scheduledEnd: sched?.shifts?.end_time || '17:00',
+                    clockIn: record.clock_in,
+                    clockOut: record.clock_out,
+                    hourlyRate: baseRate,
+                    isOvernight: !!sched?.shifts?.is_overnight,
+                    gracePeriodMins: sched?.shifts?.grace_period_mins || 0,
+                  })
+
+                  return (
+                    <div key={record.id} className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 sm:gap-3 rounded-xl border border-border p-3 hover:bg-muted/30 transition-colors">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <Avatar className="size-9 shrink-0 ring-1 ring-border">
+                          {record.employees?.avatar_url && <AvatarImage src={record.employees.avatar_url} className="object-cover" />}
+                          <AvatarFallback className="bg-primary/10 text-xs text-primary font-bold">
+                            {`${record.employees?.first_name?.[0] ?? ''}${record.employees?.last_name?.[0] ?? ''}`}
+                          </AvatarFallback>
+                        </Avatar>
+                        <div className="min-w-0">
+                          <p className="truncate text-xs sm:text-sm font-semibold text-foreground">
+                            {record.employees?.first_name} {record.employees?.last_name}
+                          </p>
+                          <p className="text-[11px] text-muted-foreground truncate">
+                            {record.employees?.position || 'Staff'} • {record.employees?.departments?.name || 'Operations'}
+                          </p>
+                          {/* Schedule Shift tag */}
+                          <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
+                            <span className="text-[10px] text-muted-foreground font-mono">
+                              Shift: {compliance.scheduledStart}–{compliance.scheduledEnd}
+                            </span>
+                            {compliance.isLate && (
+                              <Badge variant="outline" className="text-[9px] font-bold border-amber-300 bg-amber-50 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
+                                Late: -{compliance.tardinessMinutes}m (-₱{compliance.tardinessDeduction})
+                              </Badge>
+                            )}
+                            {compliance.isUndertime && (
+                              <Badge variant="outline" className="text-[9px] font-bold border-rose-300 bg-rose-50 text-rose-800 dark:bg-rose-950/40 dark:text-rose-300">
+                                Early Out: -{compliance.undertimeMinutes}m (-₱{compliance.undertimeDeduction})
+                              </Badge>
+                            )}
+                          </div>
+                          {/* Mobile inline timestamp */}
+                          <div className="flex items-center gap-1.5 text-[10px] font-mono text-muted-foreground sm:hidden mt-0.5">
+                            <span>🕒 {record.clock_in ? format(new Date(record.clock_in), 'h:mm a') : '—'}</span>
+                            {record.clock_out ? <span>→ {format(new Date(record.clock_out), 'h:mm a')}</span> : <span className="text-emerald-600 font-semibold">(On Duty)</span>}
+                            {record.total_hours ? <span className="font-semibold">({record.total_hours}h)</span> : null}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-between sm:justify-end gap-2 text-xs pt-1 sm:pt-0 border-t sm:border-t-0 border-border/40">
+                        <div className="text-right hidden sm:block">
+                          <p className="font-semibold text-foreground">
+                            {record.clock_in ? format(new Date(record.clock_in), 'h:mm a') : '—'}
+                            {record.clock_out ? ` → ${format(new Date(record.clock_out), 'h:mm a')}` : ' (On Duty)'}
+                          </p>
+                          {record.total_hours ? (
+                            <p className="text-[10px] text-muted-foreground font-mono">{record.total_hours}h paid</p>
+                          ) : null}
+                        </div>
+
+                        {recHoliday && (
+                          <Badge 
+                            variant="outline" 
+                            className={`text-[9px] font-bold ${
+                              recHoliday.type === 'regular' 
+                                ? 'border-blue-300 bg-blue-50 text-blue-800 dark:bg-blue-950 dark:text-blue-300' 
+                                : 'border-amber-300 bg-amber-50 text-amber-800 dark:bg-amber-950 dark:text-amber-300'
+                            }`}
+                            title={`${recHoliday.name}: ${recHoliday.payRuleWorked}`}
+                          >
+                            🇵🇭 {recHoliday.type === 'regular' ? '200% Double Pay' : '130%'}
+                          </Badge>
+                        )}
+
+                        <Badge className={`text-[10px] font-semibold ${cfg.className}`}>
+                          <Icon className="mr-1 size-3" />
+                          {cfg.label}
+                        </Badge>
+
+                        {record.location && (
+                          <LocationMapDialog
+                            clockInLocation={(record.location as any)?.clockIn}
+                            clockOutLocation={(record.location as any)?.clockOut}
+                          />
+                        )}
+
+                        {can.manageAttendance() && (
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button variant="ghost" size="icon" className="size-7">
+                                <MoreHorizontal className="size-3.5" />
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end">
+                              <DropdownMenuItem onClick={() => openManualEdit(record)}>
+                                <Edit2 className="mr-2 size-3.5" /> Edit Timecard
+                              </DropdownMenuItem>
+                              <DropdownMenuItem className="text-destructive" onClick={() => setDeleteRecordId(record.id)}>
+                                <Trash2 className="mr-2 size-3.5" /> Delete Record
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Analytics & History Tabs */}
+      <Tabs defaultValue="history" className="space-y-4">
+        <TabsList className="bg-muted/70">
+          <TabsTrigger value="history">Attendance History Calendar</TabsTrigger>
+          <TabsTrigger value="monthly">Monthly Master DTR Aggregation</TabsTrigger>
+          {can.manageAttendance() && <TabsTrigger value="map">Field Personnel Live Map</TabsTrigger>}
+        </TabsList>
+
+        {/* TAB 1: ATTENDANCE HISTORY CALENDAR */}
+        <TabsContent value="history" className="space-y-4">
+          <Card className="border-border/70 shadow-xs">
+            <CardHeader>
+              <CardTitle className="text-base">Historical Attendance Calendar</CardTitle>
+              <CardDescription>Select any date on the calendar to view verified logs, timecard entries, and official Philippine holiday rules</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="flex flex-col md:flex-row gap-6">
+                <div className="space-y-3">
+                  <div className="rounded-md border p-3 flex justify-center bg-card shadow-xs">
+                    <Calendar
+                      mode="single"
+                      selected={selectedDate}
+                      onSelect={(d) => d && setSelectedDate(d)}
+                      className="rounded-md"
+                    />
+                  </div>
+
+                  {selectedDateHoliday && (
+                    <div className="rounded-lg border border-rose-200 bg-rose-50/80 p-3 text-xs dark:border-rose-900/60 dark:bg-rose-950/30 space-y-1.5 max-w-[280px]">
+                      <div className="flex items-center gap-1.5 font-bold text-rose-700 dark:text-rose-300">
+                        <Flag className="size-3.5" />
+                        <span className="truncate">{selectedDateHoliday.name}</span>
+                      </div>
+                      <Badge className={`text-[9px] px-1.5 py-0 ${selectedDateHoliday.type === 'regular' ? 'bg-blue-600 text-white' : 'bg-amber-600 text-white'}`}>
+                        {selectedDateHoliday.type === 'regular' ? 'Regular Holiday (Paid 100%)' : 'Special Non-Working (130%)'}
+                      </Badge>
+                      <p className="text-[10px] text-muted-foreground pt-0.5">
+                        {selectedDateHoliday.payRuleWorked}
+                      </p>
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex-1 space-y-3">
+                  <div className="flex items-center justify-between border-b pb-2">
+                    <h3 className="font-semibold text-sm flex items-center gap-2">
+                      Logs for {format(selectedDate, 'MMMM d, yyyy')}
+                      {selectedDateHoliday && (
+                        <Badge variant="outline" className="text-[10px] border-rose-300 bg-rose-50 text-rose-800 dark:bg-rose-950 dark:text-rose-300">
+                          🇵🇭 {selectedDateHoliday.name}
+                        </Badge>
+                      )}
+                    </h3>
+                    <span className="text-xs text-muted-foreground font-medium">
+                      {filteredAttendance.length} records
+                    </span>
+                  </div>
+
+                  <div className="space-y-2 max-h-[350px] overflow-y-auto pr-1">
+                    {filteredAttendance.length === 0 ? (
+                      <p className="text-sm text-muted-foreground py-12 text-center">
+                        No logs recorded for this date.
+                      </p>
+                    ) : (
+                      filteredAttendance.map(record => {
+                        const recHoliday = getHolidayForDate(record.date)
+                        return (
+                          <div key={record.id} className="flex items-center justify-between p-3 rounded-lg border border-border text-xs hover:bg-muted/30">
+                            <div className="flex items-center gap-3">
+                              <Avatar className="size-8">
+                                {record.employees?.avatar_url && <AvatarImage src={record.employees.avatar_url} />}
+                                <AvatarFallback>{record.employees?.first_name?.[0]}</AvatarFallback>
+                              </Avatar>
+                              <div>
+                                <p className="font-semibold text-foreground text-sm">{record.employees?.first_name} {record.employees?.last_name}</p>
+                                <p className="text-[11px] text-muted-foreground">
+                                  In: {record.clock_in ? format(new Date(record.clock_in), 'hh:mm a') : 'N/A'} • Out: {record.clock_out ? format(new Date(record.clock_out), 'hh:mm a') : 'N/A'}
+                                </p>
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              {recHoliday && (
+                                <Badge 
+                                  variant="outline" 
+                                  className={`text-[9px] font-bold ${
+                                    recHoliday.type === 'regular' 
+                                      ? 'border-blue-300 bg-blue-50 text-blue-800 dark:bg-blue-950 dark:text-blue-300' 
+                                      : 'border-amber-300 bg-amber-50 text-amber-800 dark:bg-amber-950 dark:text-amber-300'
+                                  }`}
+                                >
+                                  🇵🇭 {recHoliday.type === 'regular' ? '200% Pay' : '130% Pay'}
+                                </Badge>
+                              )}
+                              <Badge className={ATT_STATUS_CONFIG[record.status]?.className || ''}>
+                                {ATT_STATUS_CONFIG[record.status]?.label || record.status}
+                              </Badge>
+                              {record.location && (
+                                <LocationMapDialog
+                                  clockInLocation={(record.location as any)?.clockIn}
+                                  clockOutLocation={(record.location as any)?.clockOut}
+                                />
+                              )}
+                            </div>
+                          </div>
+                        )
+                      })
+                    )}
+                  </div>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        {/* TAB 2: MONTHLY DTR AGGREGATION */}
+        <TabsContent value="monthly" className="space-y-4">
+          <Card className="border-border/70 shadow-xs">
+            <CardHeader>
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div>
+                  <CardTitle className="text-base">Monthly Master DTR Aggregation</CardTitle>
+                  <CardDescription>Consolidated timecards and DOLE Form 48 generators for {format(calendarMonth, 'MMMM yyyy')}</CardDescription>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button variant="outline" size="sm" onClick={() => setCalendarMonth(subDays(startOfMonth(calendarMonth), 1))}>
+                    Previous Month
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={() => setCalendarMonth(new Date())}>
+                    Current Month
+                  </Button>
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-sm">
+                  <thead>
+                    <tr className="border-b border-border text-xs text-muted-foreground uppercase bg-muted/30">
+                      <th className="py-3 px-3">Employee</th>
+                      <th className="py-3 px-3 text-center">Present</th>
+                      <th className="py-3 px-3 text-center">Late / Tardy</th>
+                      <th className="py-3 px-3 text-center">Half Day</th>
+                      <th className="py-3 px-3 text-center">Absent</th>
+                      <th className="py-3 px-3 text-center">Holiday Shifts</th>
+                      <th className="py-3 px-3 text-center">Total Paid Hours</th>
+                      <th className="py-3 px-3 text-right">Official DTR Form 48</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-border">
+                    {monthlySummary.length === 0 ? (
+                      <tr>
+                        <td colSpan={8} className="py-8 text-center text-muted-foreground">
+                          No monthly records available for this period.
+                        </td>
+                      </tr>
+                    ) : (
+                      monthlySummary.map(item => (
+                        <tr key={item.employee?.id} className="hover:bg-muted/40 transition-colors">
+                          <td className="py-3 px-3 flex items-center gap-2.5 font-medium">
+                            <Avatar className="size-7">
+                              {item.employee?.avatar_url && <AvatarImage src={item.employee.avatar_url} />}
+                              <AvatarFallback className="text-[10px]">{item.employee?.first_name?.[0]}</AvatarFallback>
+                            </Avatar>
+                            <div>
+                              <p className="font-semibold text-foreground text-xs">{item.employee?.first_name} {item.employee?.last_name}</p>
+                              <p className="text-[10px] text-muted-foreground">{item.employee?.departments?.name || 'Operations'}</p>
+                            </div>
+                          </td>
+                          <td className="py-3 px-3 text-center text-emerald-600 font-semibold">{item.present}</td>
+                          <td className="py-3 px-3 text-center text-amber-600 font-semibold">{item.late}</td>
+                          <td className="py-3 px-3 text-center text-purple-600 font-semibold">{item.half_day}</td>
+                          <td className="py-3 px-3 text-center text-red-600 font-semibold">{item.absent}</td>
+                          <td className="py-3 px-3 text-center text-blue-600 font-semibold">{item.holiday}</td>
+                          <td className="py-3 px-3 text-center font-mono font-bold text-foreground">{item.totalHours.toFixed(1)}h</td>
+                          <td className="py-3 px-3 text-right">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-8 text-xs gap-1.5"
+                              onClick={() => setDtrEmployee(item.employee)}
+                            >
+                              <Printer className="size-3.5" />
+                              Generate DTR
+                            </Button>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        {/* TAB 3: FIELD PERSONNEL LIVE MAP */}
+        {can.manageAttendance() && (
+          <TabsContent value="map" className="space-y-4">
+            <DailyAttendanceMap records={todayAttendance || []} />
+          </TabsContent>
+        )}
+      </Tabs>
+
+      {/* MANUAL ATTENDANCE ENTRY / OVERRIDE DIALOG */}
+      <Dialog open={manualRecordOpen} onOpenChange={setManualRecordOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>{manualForm.id ? 'Edit Attendance Record' : 'Manual Timecard Entry'}</DialogTitle>
+            <DialogDescription>
+              Log or override timecard logs for official business, forgotten clock-ins, or excused shifts.
+            </DialogDescription>
+          </DialogHeader>
+
+          <form onSubmit={handleSaveManualRecord} className="space-y-3.5 mt-2">
+            <div className="space-y-1">
+              <Label className="text-xs">Employee *</Label>
+              <Select
+                value={manualForm.employee_id}
+                onValueChange={v => setManualForm(p => ({ ...p, employee_id: v }))}
+                disabled={!!manualForm.id}
+              >
+                <SelectTrigger><SelectValue placeholder="Select Employee" /></SelectTrigger>
+                <SelectContent>
+                  {employees?.map(e => (
+                    <SelectItem key={e.id} value={e.id}>
+                      {e.first_name} {e.last_name} ({e.departments?.name || 'Operations'})
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="space-y-1">
+              <Label className="text-xs">Date *</Label>
+              <Input
+                type="date"
+                value={manualForm.date}
+                onChange={e => setManualForm(p => ({ ...p, date: e.target.value }))}
+                required
+              />
+            </div>
+
+            {(() => {
+              const manualHoliday = getHolidayForDate(manualForm.date)
+              if (!manualHoliday) return null
+              return (
+                <div className="rounded-lg border border-rose-200 bg-rose-50/80 dark:border-rose-900/60 dark:bg-rose-950/30 p-2.5 text-xs space-y-1">
+                  <div className="flex items-center gap-1.5 font-bold text-rose-700 dark:text-rose-300">
+                    <Flag className="size-3.5" />
+                    <span>{manualHoliday.name} ({manualHoliday.type === 'regular' ? 'Regular Holiday' : 'Special Non-Working Day'})</span>
+                  </div>
+                  <p className="text-[11px] text-muted-foreground">
+                    {manualHoliday.payRuleWorked}
+                  </p>
+                </div>
+              )
+            })()}
+
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <Label className="text-xs">Clock In Time</Label>
+                <Input
+                  type="time"
+                  value={manualForm.clock_in_time}
+                  onChange={e => setManualForm(p => ({ ...p, clock_in_time: e.target.value }))}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs">Clock Out Time</Label>
+                <Input
+                  type="time"
+                  value={manualForm.clock_out_time}
+                  onChange={e => setManualForm(p => ({ ...p, clock_out_time: e.target.value }))}
+                />
+              </div>
+            </div>
+
+            <div className="space-y-1">
+              <Label className="text-xs">Attendance Status</Label>
+              <Select value={manualForm.status} onValueChange={v => setManualForm(p => ({ ...p, status: v }))}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="present">Present</SelectItem>
+                  <SelectItem value="late">Late / Tardy</SelectItem>
+                  <SelectItem value="half_day">Half Day</SelectItem>
+                  <SelectItem value="ob">Official Business (OB)</SelectItem>
+                  <SelectItem value="absent">Absent</SelectItem>
+                  <SelectItem value="holiday">Holiday</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="space-y-1">
+              <Label className="text-xs">Audit Justification / Notes</Label>
+              <Input
+                value={manualForm.notes}
+                onChange={e => setManualForm(p => ({ ...p, notes: e.target.value }))}
+                placeholder="e.g. Field dispatch OB slip #1043"
+              />
+            </div>
+
+            <DialogFooter className="pt-2">
+              <Button type="button" variant="outline" onClick={() => setManualRecordOpen(false)}>Cancel</Button>
+              <Button type="submit" disabled={manualMutation.isPending}>
+                {manualMutation.isPending ? 'Saving...' : 'Save Timecard'}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      {/* DELETE CONFIRMATION DIALOG */}
+      <AlertDialog open={!!deleteRecordId} onOpenChange={open => !open && setDeleteRecordId(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete Attendance Record</AlertDialogTitle>
+            <AlertDialogDescription>
+              Are you sure you want to delete this attendance log? This action cannot be undone and will remove the corresponding timecard entry from payroll computation.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={handleDeleteRecord}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              Delete Log
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* OFFICIAL DOLE DTR DIALOG */}
+      {dtrEmployee && (
+        <DOLEDTRDialog
+          open={!!dtrEmployee}
+          onOpenChange={open => !open && setDtrEmployee(null)}
+          employee={dtrEmployee}
+          records={monthAttendance?.filter(r => r.employee_id === dtrEmployee.id) || []}
+          monthDate={calendarMonth}
+          schedules={monthSchedules}
+        />
+      )}
+    </div>
+  )
+}

@@ -1,0 +1,127 @@
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { supabase, ORG_ID } from '@/lib/supabase'
+import { format } from 'date-fns'
+import type { Shift, Schedule } from '@/types'
+
+export function useShifts() {
+  return useQuery({
+    queryKey: ['shifts'],
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from('shifts')
+        .select('*')
+        .eq('org_id', ORG_ID)
+        .eq('is_active', true)
+        .order('name')
+      if (error) throw error
+      return data as Shift[]
+    },
+  })
+}
+
+import { useAuthStore } from '@/stores/auth.store'
+
+export function useSchedules(startDate: string, endDate: string, employeeId?: string) {
+  const { employee } = useAuthStore()
+  return useQuery({
+    queryKey: ['schedules', startDate, endDate, employeeId],
+    queryFn: async () => {
+      let q = supabase
+        .from('schedules')
+        .select('*, employees(id, first_name, last_name, avatar_url, position, departments(name)), shifts(*)')
+        .gte('date', startDate)
+        .lte('date', endDate)
+        .order('date')
+      if (employeeId) q = q.eq('employee_id', employeeId)
+      else if (employee?.role === 'employee') {
+        q = q.eq('employee_id', employee.id)
+      }
+      const { data, error } = await q
+      if (error) throw error
+      return data as Schedule[]
+    },
+  })
+}
+
+export function useCreateSchedule() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (schedule: Partial<Schedule>) => {
+      const { data, error } = await supabase
+        .from('schedules')
+        .upsert(schedule, { onConflict: 'employee_id,date' })
+        .select()
+        .single()
+      if (error) throw error
+      return data
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['schedules'] }),
+  })
+}
+
+export function useBulkCreateSchedule() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (schedules: Partial<Schedule>[]) => {
+      const { data, error } = await supabase
+        .from('schedules')
+        .upsert(schedules, { onConflict: 'employee_id,date' })
+        .select()
+      if (error) throw error
+      return data
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['schedules'] }),
+  })
+}
+
+export function useUpdateSchedule() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ id, ...updates }: Partial<Schedule> & { id: string }) => {
+      const { data, error } = await supabase
+        .from('schedules')
+        .update({ ...updates, updated_at: new Date().toISOString() })
+        .eq('id', id)
+        .select()
+        .single()
+      if (error) throw error
+      return data
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['schedules'] }),
+  })
+}
+
+export function useDeleteSchedule() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const { error } = await supabase
+        .from('schedules')
+        .delete()
+        .eq('id', id)
+      if (error) throw error
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['schedules'] }),
+  })
+}
+
+export function useBulkDeleteSchedules() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (ids: string[]) => {
+      if (!ids || ids.length === 0) return
+      // Perform batch deletion in chunks of 200 in a single network query
+      const chunkSize = 200
+      for (let i = 0; i < ids.length; i += chunkSize) {
+        const chunk = ids.slice(i, i + chunkSize)
+        const { error } = await supabase
+          .from('schedules')
+          .delete()
+          .in('id', chunk)
+        if (error) throw error
+      }
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['schedules'] }),
+  })
+}
+
