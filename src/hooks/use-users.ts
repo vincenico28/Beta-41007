@@ -14,17 +14,25 @@ export function useSystemUsers() {
   return useQuery({
     queryKey: ['system-users'],
     queryFn: async () => {
+      // Try Database RPC function first (avoids edge function CORS & deployment dependency)
+      const { data: rpcData, error: rpcError } = await supabase.rpc('get_system_users')
+
+      if (!rpcError && rpcData?.users) {
+        return rpcData.users as SystemUser[]
+      }
+
+      // Fallback to edge function invocation if RPC is not yet created
       const { data, error } = await supabase.functions.invoke('manage-users', {
         body: { action: 'list' }
       })
-      console.log('manage-users list result:', { data, error })
+
       if (error) {
-        throw new Error(error.message || `Invoke error: ${JSON.stringify(error)}`)
+        throw new Error(rpcError?.message || error.message || 'Failed to fetch system users')
       }
       if (data?.error) {
-        throw new Error(typeof data.error === 'string' ? data.error : `Data error: ${JSON.stringify(data.error)}`)
+        throw new Error(typeof data.error === 'string' ? data.error : JSON.stringify(data.error))
       }
-      return data?.users as SystemUser[]
+      return (data?.users || []) as SystemUser[]
     },
   })
 }
@@ -33,10 +41,22 @@ export function useManageSystemUser() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ action, userId, newPassword }: { action: 'update_password' | 'suspend' | 'unsuspend' | 'delete', userId: string, newPassword?: string }) => {
+      // Try Database RPC function first
+      const { data: rpcData, error: rpcError } = await supabase.rpc('manage_system_user', {
+        p_action: action,
+        p_user_id: userId,
+        p_new_password: newPassword || null,
+      })
+
+      if (!rpcError && rpcData?.success) {
+        return rpcData
+      }
+
+      // Fallback to edge function invocation
       const { data, error } = await supabase.functions.invoke('manage-users', {
         body: { action, userId, newPassword }
       })
-      if (error) throw new Error(error.message)
+      if (error) throw new Error(rpcError?.message || error.message)
       if (data?.error) throw new Error(data.error)
       return data
     },
